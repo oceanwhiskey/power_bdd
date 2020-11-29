@@ -12,7 +12,7 @@ setuptools.setup(
     description="Calculates power indices (Banzhaf/Penrose, Shapley/Shubik) via binary decision diagrams",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/pypa/sampleproject",
+    url="https://github.com/oceanwhiskey/power_bdd",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
