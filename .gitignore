@@ -5,3 +5,4 @@ Scripts
 pyvenv.cfg
 .pytest_cache
 **\__pycache__
+dist
