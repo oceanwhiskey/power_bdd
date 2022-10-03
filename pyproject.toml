@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "power-bdd"
+version = "0.0.1"
+authors = [
+  { name="Ingo Wilms", email="ingo.wilms@gmail.com" },
+]
+dependencies = [
+  'sortedcontainers >= 2.0',
+]
+description = "Calculates power indices (Banzhaf/Penrose, Shapley/Shubik) via binary decision diagrams"
+readme = "README.md"
+license = { file="LICENSE" }
+requires-python = ">=3.6"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/oceanwhiskey/power_bdd"
+"Bug Tracker" = "https://github.com/oceanwhiskey/power_bdd/issues"

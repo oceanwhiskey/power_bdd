@@ -1,0 +1,7 @@
+Include
+Lib
+Scripts
+.git
+pyvenv.cfg
+.pytest_cache
+**\__pycache__

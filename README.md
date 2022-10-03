@@ -1,6 +1,11 @@
 # power_bdd
+Let $N=\{1,2,..,n\}$ be a set of voters, each with a voting weight of $w_i$, who vote *yes* or *no* over a proposal. A coalition $S\in 2^N$ of yes-voters is considered winning if $\sum_{i\in S} w_i$ is greater or equal to a quota $q$. What is the voting power of each voter?
 
-Creates the ROBDD of a weighted game and calculates power indices according to Banzhaf/Penrose and Shapley/Shubik.
+One very intuitive definition of the voting power of a voter is the probability that she/he influences the outcome by her/his vote given an assumed voting behaviour of all other voters. This leads to the notion of power indices. The most well known two are those according to Banzhaf/Penrose and Shapley/Shubik.
+
+One very cool way to calculated them is by using binary decision diagrams.
+
+This package creates the reduced ordered binary decision diagram ("ROBDD") of a weighted game and calculates power indices according to Banzhaf/Penrose and Shapley/Shubik.
 This method allows to easily connect bdds with AND or OR and is also suited for voting systems with multiple layers.
 The method was published by S. Bolus:
 * [Bolus, S., 2011. Power indices of simple games and vector-weighted majority games by means of binary decision diagrams. European J. Oper. Res. 210 (2), 258–272.](https://www.sciencedirect.com/science/article/abs/pii/S0377221710006181)
@@ -28,7 +33,9 @@ This example calculates the power indices for the electoral college, 1996.
 
 ## multi-tier games
 This example calculates the power-indices for the U.S. federal system, which can represented by the weighted voting systems
-_G = (G1 and G2 and G3) or (G1 and G4 and G5 and G3) or (G6 and G7)_, 
+
+$G$ = ($G_1$ and $G_2$ and $G_3$) or ($G_1$ and $G_4$ and $G_5$ and $G_3$) or ($G_6$ and $G_7$), 
+
 see https://www.fernuni-hagen.de/stochastik/downloads/voting.pdf.
 
     game1 = WeightedGame(218, [0, 0] + [0] * 100 + [1] * 435)
@@ -44,21 +51,22 @@ see https://www.fernuni-hagen.de/stochastik/downloads/voting.pdf.
     print(banzhaf)
 
 # Complexities
-Listed complexities are expected complexities for the computation of all voters. At first glance, the complexities seem partly worse than other methods (e.g. using _dynamic programming_), but there are several hidden benefitial properties, for instance _q_ is not necessary the _q_ input _q_, but the smallest integer that is possible to use as quota to represent the game (with any weights).
+Listed complexities are expected complexities for the computation of all voters. At first glance, the complexities seem partly worse than other methods (e.g. using *dynamic programming*), but there are several hidden benefitial properties, for instance $q$ is not necessary the $q$ input $q$, but the smallest integer that is possible to use as quota to represent the game (with any weights).
 
 ## one-tier games:
 
-    power-index     | time          | space       
-    ------------    | ------------- | ------------
-    Banzhaf/Penrose | O(nq log(q))  | O(nq)
-    Shapley/Shubik  | O(n^3q)       | O(n^2q)
+power-index     |time            | space       
+--------------- | -------------- | ---------
+Banzhaf/Penrose | $O(nq log(q))$ | $O(nq)$
+Shapley/Shubik  | $O(n^3q)$      | $O(n^2q)$
+
 
 ## multi-tier games with _m_ tiers:
 
-    power-index     | time                   | space       
-    ------------    | -------------          | ------------
-    Banzhaf/Penrose | O(n prod_{t=1}^m q^t)  | O(n prod_{t=1}^m q^t)
-    Shapley/Shubik  | O(n^3 prod_{t=1}^m q^t)| O(n^2 prod_{t=1}^m q^t)
+power-index     | time                       | space       
+--------------- | -------------------------- | --------------------------
+Banzhaf/Penrose | $O(n \prod_{t=1}^m q^t)$   | $O(n \prod_{t=1}^m q^t)$
+Shapley/Shubik  | $O(n^3 \prod_{t=1}^m q^t)$ | $O(n^2 \prod_{t=1}^m q^t)$
 
 # Remarks
 * My java-version is much faster (somewhere between 10-100 times) so there should be plenty of room for optimization in python.
