@@ -57,7 +57,7 @@ Listed complexities are expected complexities for the computation of all voters.
 
 power-index     |time            | space       
 --------------- | -------------- | ---------
-Banzhaf/Penrose | $O(nq log(q))$ | $O(nq)$
+Banzhaf/Penrose | $O(nq \log(q))$ | $O(nq)$
 Shapley/Shubik  | $O(n^3q)$      | $O(n^2q)$
 
 
@@ -65,9 +65,9 @@ Shapley/Shubik  | $O(n^3q)$      | $O(n^2q)$
 
 power-index     | time                       | space       
 --------------- | -------------------------- | --------------------------
-Banzhaf/Penrose | $O(n \prod_{t=1}^m q^t)$   | $O(n \prod_{t=1}^m q^t)$
-Shapley/Shubik  | $O(n^3 \prod_{t=1}^m q^t)$ | $O(n^2 \prod_{t=1}^m q^t)$
+Banzhaf/Penrose | $O(n \prod\limits_{t=1}^m q^t)$   | $O(n \prod\limits_{t=1}^m q^t)$
+Shapley/Shubik  | $O(n^3 \prod\limits_{t=1}^m q^t)$ | $O(n^2 \prod\limits_{t=1}^m q^t)$
 
 # Remarks
-* My java-version is much faster (somewhere between 10-100 times) so there should be plenty of room for optimization in python.
+* My java-version is much faster (somewhere between 10-100 times) so there should be plenty of room for optimization in python. Although beautiful is better than ugly, I guess fast is better than slow... and we need more trees! Not just to save the planet, but also in python.
 * The original version uses an AVL-tree for the _create_-method. I have replaced that by a _SortedList_ form the _sortedcontainers_-library.    
