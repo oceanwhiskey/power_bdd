@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "power-bdd"
-version = "0.0.1"
+version = "0.0.2"
 authors = [
   { name="Ingo Wilms", email="ingo.wilms@gmail.com" },
 ]
