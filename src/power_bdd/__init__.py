@@ -15,7 +15,7 @@ from .errors import MethodNotApplicable, NotCompleteError, PowerBDDError
 from .game import CompositeGame, Game, WeightedGame
 from .results import MinimumQuotaResult, PowerIndex
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 __all__ = [
     "Game",
