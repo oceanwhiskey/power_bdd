@@ -35,9 +35,13 @@ test = ["pytest >= 7"]
 [project.urls]
 "Homepage" = "https://github.com/oceanwhiskey/power_bdd"
 "Bug Tracker" = "https://github.com/oceanwhiskey/power_bdd/issues"
+"Documentation" = "https://github.com/oceanwhiskey/power_bdd/blob/main/docs/power_bdd_paper.pdf"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/power_bdd"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["docs/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

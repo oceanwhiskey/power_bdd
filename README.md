@@ -18,6 +18,17 @@ measure how much influence each voter has. `power_bdd` computes, exactly
 for weighted games and for multi-tier games built with AND and OR, such as
 double-majority rules.
 
+## Theory
+
+The algorithms, their proofs and their complexity are described in
+
+> I. Wilms, *Exact Johnston and Deegan–Packel power indices via decision
+> diagrams and dynamic programming* (2026),
+> [docs/power_bdd_paper.pdf](https://github.com/oceanwhiskey/power_bdd/blob/main/docs/power_bdd_paper.pdf).
+
+Section 9 of the paper maps every method of the package to the section that
+derives it; Appendix D covers the minimum quota without an LP solver.
+
 ## Installation
 
     pip install power_bdd
@@ -254,6 +265,9 @@ Version 2 is a complete rewrite and not compatible with 1.x: the module
 
 ## References
 
+* I. Wilms, Exact Johnston and Deegan–Packel power indices via decision
+  diagrams and dynamic programming (2026),
+  [docs/power_bdd_paper.pdf](https://github.com/oceanwhiskey/power_bdd/blob/main/docs/power_bdd_paper.pdf).
 * S. Bolus, Power indices of simple games and vector-weighted majority
   games by means of binary decision diagrams, European Journal of
   Operational Research 210 (2011) 258–272.
