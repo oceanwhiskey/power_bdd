@@ -9,17 +9,18 @@ any representation valid) on the polyhedron
 
 Its coalition rows are never listed; the winning QOBDD supplies them:
 
-1. *Direct certificate.*  Coalitions that are tight at the given weights
-   are harvested from the diagram; a least-squares guess of nonnegative
-   multipliers is turned into an exact certificate.  This closes every
-   game whose given weights are already minimal.
-2. *Active set.*  An exact primal simplex on the implicit polyhedron
+1. *Active set.*  An exact primal simplex on the implicit polyhedron
    starts at the given weights.  The inverse of the working rows is kept
    as an integer adjugate (Bareiss updates); the ratio test is an exact
-   lexicographic dynamic program on the diagram.  At the LP optimum the
-   multipliers prove ``q_min >= ceil(q*)``; rounded optimal weights give
-   an upper bound after an exact integer check.
-3. *Integer gap.*  If the bounds still differ, the active set runs on the
+   lexicographic dynamic program on the diagram.  At every new vertex,
+   the start included, nonnegative least squares on the tight rows, with
+   column generation from the diagram, proposes a dual solution, and its
+   support is exchanged into the basis without moving the point; this
+   skips the long runs of degenerate pivots at a degenerate optimum.  At
+   the LP optimum the multipliers prove ``q_min >= ceil(q*)``; rounded
+   optimal weights give an upper bound after an exact integer check.  If
+   the optimum is the start point, the given weights are already minimal.
+2. *Integer gap.*  If the bounds still differ, the active set runs on the
    labelled game (one weight per player, at most 32 players); a basis with
    strictly positive multipliers allows an exact enumeration of all cheaper
    integer slack combinations.
@@ -103,7 +104,9 @@ class _Oracle:
         M = 2 * Sb + 1
         if Pb * M + Sb < INT64_SAFE:
             return self._packed(P, S, Sb, M)
-        return self._pairs(P, S)
+        if Pb < INT64_SAFE and Sb < INT64_SAFE:
+            return self._pairs(P, S, np.int64)       # two int64 arrays, still exact
+        return self._pairs(P, S, object)
 
     def _trace(self, takes) -> bytes:
         counts = bytearray(self.classes.k)
@@ -145,12 +148,12 @@ class _Oracle:
 
         return decode(int(aw[0]), take_w, 1), decode(int(al[0]), take_l, -1)
 
-    def _pairs(self, P, S):
+    def _pairs(self, P, S, dtype=object):
         acc = self.d.accepting.astype(bool)
         results = []
         for target, minimize in ((True, True), (False, False)):
-            a = np.zeros(len(acc), dtype=object)
-            b = np.zeros(len(acc), dtype=object)
+            a = np.zeros(len(acc), dtype=dtype)
+            b = np.zeros(len(acc), dtype=dtype)
             valid = acc.copy() if target else ~acc
             takes = [None] * self.n
             for i in range(self.n - 1, -1, -1):
@@ -217,7 +220,9 @@ class _Oracle:
                 predecessor[children[matches]] = codes[matches]
                 prefix.append(nxt)
                 pred.append(predecessor)
-        rows = set()
+        # one extremal coalition per (level, choice, outcome): its node on the
+        # level, then all of them traced back and forward together
+        starts_level, starts_bit, starts_win, starts_node, starts_child = [], [], [], [], []
         for i in range(n):
             e, t = d.else_children[i], d.then_children[i]
             for bit, targets in ((0, e), (1, t)):
@@ -229,31 +234,45 @@ class _Oracle:
                     pos = int(np.argmin(scores) if winning else np.argmax(scores))
                     if not np.isfinite(scores[pos]):
                         continue
-                    counts = bytearray(self.classes.k)
-                    node = pos
-                    for level in range(i - 1, -1, -1):
-                        code = int((pred_min if winning else pred_max)[level + 1][node])
-                        parent, selected = divmod(code, 2)
-                        if selected:
-                            h = self.level_class[level]
-                            if h >= 0:
-                                counts[h] += 1
-                        node = parent
-                    if bit and self.level_class[i] >= 0:
-                        counts[self.level_class[i]] += 1
-                    node = int(targets[pos])
-                    takes = tmin if winning else tmax
-                    for level in range(i + 1, n):
-                        if takes[level][node]:
-                            h = self.level_class[level]
-                            if h >= 0:
-                                counts[h] += 1
-                            node = int(d.then_children[level][node])
-                        else:
-                            node = int(d.else_children[level][node])
-                    counts = bytes(counts)
-                    if self.classes.classify(counts) == winning:
-                        rows.add((counts, winning))
+                    starts_level.append(i)
+                    starts_bit.append(bit)
+                    starts_win.append(winning)
+                    starts_node.append(pos)
+                    starts_child.append(int(targets[pos]))
+        if not starts_level:
+            return set()
+        level_of = np.array(starts_level)
+        win = np.array(starts_win)
+        lc = np.array(self.level_class)
+        counts = np.zeros((len(level_of), self.classes.k), dtype=np.int64)
+        node = np.array(starts_node, dtype=np.int64)
+        for level in range(n - 2, -1, -1):          # prefixes: from level+1 back to level
+            for flag, pred in ((True, pred_min), (False, pred_max)):
+                sub = np.flatnonzero((level_of > level) & (win == flag))
+                if len(sub) == 0:
+                    continue
+                code = pred[level + 1][node[sub]]
+                if lc[level] >= 0:
+                    np.add.at(counts[:, lc[level]], sub[code % 2 == 1], 1)
+                node[sub] = code // 2
+        own = np.flatnonzero((np.array(starts_bit) == 1) & (lc[level_of] >= 0))
+        np.add.at(counts, (own, lc[level_of[own]]), 1)
+        node = np.array(starts_child, dtype=np.int64)
+        for level in range(1, n):                   # suffixes: follow the best choices
+            for flag, takes in ((True, tmin), (False, tmax)):
+                sub = np.flatnonzero((level_of < level) & (win == flag))
+                if len(sub) == 0:
+                    continue
+                here = node[sub]
+                take = takes[level][here]
+                if lc[level] >= 0:
+                    np.add.at(counts[:, lc[level]], sub[take], 1)
+                node[sub] = np.where(take, d.then_children[level][here], d.else_children[level][here])
+        rows = set()
+        for row, winning in zip(counts.astype(np.uint8), starts_win):
+            key = row.tobytes()
+            if self.classes.classify(key) == winning:
+                rows.add((key, winning))
         return rows
 
 
@@ -294,56 +313,6 @@ def _ceil(x: Fraction) -> int:
     return -(-x.numerator // x.denominator)
 
 
-def _float_certificate(classes, rows, values):
-    """Turn numerical multipliers into exact integers and certify."""
-    values = [Fraction.from_float(max(0.0, float(x))) for x in values]
-    if not values:
-        return None
-    denominator = max(v.denominator for v in values)
-    numbers = [v.numerator * (denominator // v.denominator) for v in values]
-    common = reduce(gcd, numbers, 0) or 1
-    return _certificate(classes, rows, [x // common for x in numbers])
-
-
-def _direct_certificate(classes, rows, incumbent, upper, max_steps=12):
-    """Exact lower proof from rows tight at a verified incumbent, if any.
-
-    An SVD whitens the tight-row system for multipliers with q-coefficient
-    one; negative trial multipliers are removed greedily.  Heuristic search,
-    exact acceptance.
-    """
-    tight = [(z, b) for z, b in rows
-             if sum(c * w for c, w in zip(z, incumbent)) == upper - (not b)]
-    if len(tight) < classes.k + 1:
-        return None
-    matrix = np.empty((classes.k + 1, len(tight)))
-    for j, (counts, winning) in enumerate(tight):
-        sign = 1 if winning else -1
-        matrix[:-1, j] = sign * np.frombuffer(counts, dtype=np.uint8).astype(float)
-        matrix[-1, j] = -sign
-    try:
-        u, singular, whitened = np.linalg.svd(matrix, full_matrices=False)
-        if singular[-1] <= np.finfo(float).eps * max(matrix.shape) * singular[0]:
-            return None
-        rhs = u[-1] / singular
-        gram = np.eye(len(singular))
-        keep = np.arange(len(tight))
-        for _ in range(max_steps):
-            prices = whitened[:, keep].T @ np.linalg.solve(gram, rhs)
-            negative = prices < -1e-9
-            if not np.any(negative):
-                return _float_certificate(classes, [tight[int(i)] for i in keep], prices)
-            removed = keep[negative]
-            keep = keep[~negative]
-            if len(keep) < classes.k + 1:
-                return None
-            block = whitened[:, removed]
-            gram -= block @ block.T
-    except np.linalg.LinAlgError:
-        return None
-    return None
-
-
 # ---------------------------------------------------------------------------
 # exact active set
 # ---------------------------------------------------------------------------
@@ -365,6 +334,7 @@ class _ActiveSet:
         self._add(("L", bytes(k)))
         self.X = self._point()
         self.pivots = 0
+        self.moved = False
 
     def row(self, key):
         kind, data = key
@@ -439,10 +409,21 @@ class _ActiveSet:
         neg = np.flatnonzero(slopes < 0)
         if len(neg):
             slacks = self._matvec(self.pool_mat[neg], Xr) - dx * self.pool_b[neg].astype(object)
-            for idx, slack, slope in zip(neg, slacks, slopes[neg]):
-                t = Fraction(int(slack), -int(slope))
-                if best_t is None or t < best_t or (t == best_t and int(slope) < best_slope):
-                    best_t, best_key, best_slope = t, self.pool_keys[int(idx)], int(slope)
+            down = -slopes[neg]
+            zero = np.flatnonzero(slacks == 0)
+            if len(zero):
+                # degenerate step: t = 0, steepest blocking row first
+                j = zero[int(np.argmax(down[zero]))]
+                best_t, best_key, best_slope = Fraction(0), self.pool_keys[int(neg[j])], -int(down[j])
+            else:
+                # smallest slack/down: floats preselect, exact comparison decides
+                approx = np.array([float(s) for s in slacks]) / np.array([float(v) for v in down])
+                cut = float(approx.min())
+                for j in np.flatnonzero(approx <= cut * (1 + 1e-9) + 1e-300):
+                    t = Fraction(int(slacks[j]), int(down[j]))
+                    slope = -int(down[j])
+                    if best_t is None or t < best_t or (t == best_t and slope < best_slope):
+                        best_t, best_key, best_slope = t, self.pool_keys[int(neg[j])], slope
         if best_t == 0:
             return best_t, best_key
         Xw, Dw, Xq, Dq = Xr[:k], Dp[:k], Xr[k], Dp[k]
@@ -556,10 +537,107 @@ class _ActiveSet:
             if sum(u * v for u, v in zip(a, Xr) if u) == dx * b:
                 self._add(key)
 
-    def run(self, max_pivots=200_000):
+    # -- guided basis switch ---------------------------------------------------
+    def _tight(self):
+        """Indices of pool rows that are tight at the current point (exact)."""
+        self._flush()
+        Xr, dx = self._reduced()
+        values = self._matvec(self.pool_mat, Xr)
+        if values.dtype == object or dx >= (1 << 60):
+            rhs = self.pool_b.astype(object) * dx
+        else:
+            rhs = self.pool_b * dx
+        return np.flatnonzero(values == rhs)
+
+    def guided_switch(self, rounds: int = 60) -> bool:
+        """Exchange the basis for one that a numerical dual solution predicts optimal.
+
+        At a degenerate vertex many rows are tight, and the pricing rule can
+        take hundreds of degenerate pivots, finding the missing rows of the
+        certificate one dynamic program at a time.  Here nonnegative least
+        squares on the tight rows proposes multipliers lambda >= 0 with
+        sum(lambda_j a_j) = e_Q.  While the residual r is not zero, one pass
+        over the diagram finds the tight winning and losing coalitions with
+        the largest a.r (column generation) and adds them.  The support is
+        then exchanged into the basis by exact Bareiss pivots without moving
+        the point; the pricing step checks optimality exactly, so a wrong
+        proposal only costs time.
+        """
+        k = self.k
+        target = np.zeros(self.K)
+        target[self.K - 1] = 1.0
+        passive = None
+        history = []
+        for _ in range(rounds):
+            tight = self._tight()
+            if len(tight) == 0:
+                return False
+            matrix = self.pool_mat[tight].astype(float).T        # columns a_j
+            start = None
+            if passive is not None:
+                start = np.isin(tight, passive)
+            mult, residual_vec = _nnls(matrix, target, start)
+            scale = 1.0 + float(np.abs(mult).max(initial=0.0))
+            norm = float(np.linalg.norm(residual_vec))
+            if norm <= 1e-7 * scale:
+                break
+            history.append(norm)
+            if len(history) >= 3 and history[-3] - norm <= 1e-6 * history[-3]:
+                return False          # no progress: this vertex is probably not optimal
+            passive = tight[mult > 0]
+            # column generation: tight coalitions with the largest a.r
+            Xr, dx = self._reduced()
+            r_x = residual_vec[:k]
+            top = float(np.abs(r_x).max(initial=0.0))
+            if top == 0.0:
+                return False
+            secondary = [-int(round(v / top * (1 << 20))) for v in r_x]
+            win, lose = self.oracle.extremes(Xr[:k], secondary)
+            added = False
+            for kind, res in (("W", win), ("L", lose)):
+                if res is None:
+                    continue
+                tight_value = Xr[k] if kind == "W" else Xr[k] - dx
+                if res[0] != tight_value:
+                    continue
+                key = (kind, res[2])
+                a, _ = self.row(key)
+                gain = float(np.dot(np.array(a, dtype=float), residual_vec))
+                if gain > 1e-9 * scale and key not in self.pool_index:
+                    self._add(key)
+                    added = True
+            if not added:
+                return False
+        else:
+            return False
+        support = [int(tight[j]) for j in np.flatnonzero(mult > 1e-9 * max(1.0, mult.max()))]
+        if not support or len(support) > self.K:
+            return False
+        wanted = [self.pool_keys[i] for i in support]
+        wanted_set = set(wanted)
+        for key in wanted:
+            if key in self.rows:
+                continue
+            a, _ = self.row(key)
+            adj = self.adj
+            if adj.dtype == object or max(abs(v) for v in a) * int(np.abs(adj).max()) * self.K >= INT64_SAFE:
+                U = np.array(a, dtype=object) @ adj.astype(object)
+            else:
+                U = np.array(a, dtype=np.int64) @ adj
+            options = [r for r in range(self.K)
+                       if self.rows[r] not in wanted_set and int(U[r]) != 0]
+            if not options:
+                return False
+            r = min(options, key=lambda j: (self.rows[j][0] != "F", abs(int(U[j]))))
+            self.pivot(r, key, moved=False)
+        return True
+
+    def run(self, max_pivots=200_000, guided=True):
         self.bland = False
         seen, last = set(), None
         self.harvest()
+        if guided:
+            self.guided_switch()
         while True:
             choice = self.price()
             if choice is None:
@@ -571,7 +649,10 @@ class _ActiveSet:
             t, key = self.ratio(D)
             self.pivot(r, key, moved=t != 0)
             if t != 0:
+                self.moved = True
                 self.harvest()
+                if guided:
+                    self.guided_switch()      # new vertex: try to certify it at once
             value = Fraction(self.X[self.k], self.delta)
             if value != last:
                 seen.clear()
@@ -592,6 +673,99 @@ class _ActiveSet:
                 rows.append((key[1], key[0] == "W"))
                 mults.append(int(lam[j]))
         return _certificate(self.classes, rows, mults)
+
+
+def _nnls(E, f, start=None, tol=1e-10, max_iterations=None):
+    """Lawson-Hanson nonnegative least squares: min ||E x - f||, x >= 0.
+
+    The passive columns are kept with the inverse of the Cholesky factor of
+    their Gram matrix, updated in O(p^2) when a column enters and rebuilt
+    when columns leave.  ``start`` (a boolean mask) warm-starts the passive
+    set.  The result is only a proposal that the caller checks exactly.
+    Returns x and the residual vector f - E x.
+    """
+    rows, m = E.shape
+    squares = (E * E).sum(axis=0)
+    limit = max_iterations if max_iterations is not None else 6 * rows + 50
+    scale = max(1.0, float(np.abs(E).max(initial=0.0)))
+
+    def rebuild(columns):
+        if not columns:
+            return np.zeros((0, 0))
+        block = E[:, columns]
+        try:
+            lower = np.linalg.cholesky(block.T @ block)
+            return np.linalg.inv(lower.T)
+        except np.linalg.LinAlgError:
+            return None
+
+    def solve(columns, inverse):
+        if not columns:
+            return np.zeros(0)
+        return inverse @ (inverse.T @ (E[:, columns].T @ f))
+
+    passive = [] if start is None else [int(j) for j in np.flatnonzero(start)]
+    inverse = rebuild(passive)
+    if inverse is None:
+        passive, inverse = [], np.zeros((0, 0))
+    x = np.zeros(m)
+    if passive:
+        z = solve(passive, inverse)
+        keep = [c for c, v in zip(passive, z) if v > tol]
+        if len(keep) < len(passive):
+            passive, inverse = keep, rebuild(keep)
+            z = solve(passive, inverse) if inverse is not None else np.zeros(0)
+            if inverse is None or (z <= tol).any():
+                passive, inverse, z = [], np.zeros((0, 0)), np.zeros(0)
+        x[passive] = z
+    excluded = np.zeros(m, dtype=bool)
+    iterations = 0
+    while iterations < limit:
+        gradient = E.T @ (f - E @ x)
+        gradient[passive] = -np.inf
+        gradient[excluded] = -np.inf
+        j = int(np.argmax(gradient))
+        if gradient[j] <= tol * scale:
+            break
+        # add column j: R_new = [[R, r], [0, d]] with R^T r = E_P^T e_j
+        r = inverse.T @ (E[:, passive].T @ E[:, j]) if passive else np.zeros(0)
+        d2 = float(squares[j] - r @ r)
+        if d2 <= 1e-10 * float(squares[j]):
+            excluded[j] = True          # dependent on the passive columns
+            continue
+        d = d2 ** 0.5
+        p = len(passive)
+        grown = np.zeros((p + 1, p + 1))
+        grown[:p, :p] = inverse
+        grown[:p, p] = -(inverse @ r) / d
+        grown[p, p] = 1.0 / d
+        passive, inverse = passive + [j], grown
+        while iterations < limit:
+            iterations += 1
+            z = solve(passive, inverse)
+            if (z > tol).all():
+                x = np.zeros(m)
+                x[passive] = z
+                break
+            current = x[passive]
+            bad = z <= tol
+            denominator = current[bad] - z[bad]
+            ratios = np.where(denominator > 0,
+                              current[bad] / np.where(denominator > 0, denominator, 1.0), 0.0)
+            step = current + float(ratios.min()) * (z - current)
+            keep = step > tol
+            if keep.all():
+                keep = ~bad
+            dropped = [c for c, k in zip(passive, keep) if not k]
+            if dropped == [j] and float(ratios.min()) == 0.0:
+                excluded[j] = True      # numerically unusable new column
+            passive = [c for c, k in zip(passive, keep) if k]
+            x = np.zeros(m)
+            x[passive] = step[keep]
+            inverse = rebuild(passive)
+            if inverse is None:
+                return x, f - E @ x
+    return x, f - E @ x
 
 
 def _round_candidates(classes, oracle, X, delta, qstar):
@@ -681,32 +855,38 @@ def _positive_basis_enumeration(oracle, rows, quota_upper, max_candidates=100_00
     if budget < 0:
         return None
     active = [i for i, cost in enumerate(costs) if cost <= budget]
-    columns = [[row[i] for row in inverse] for i in active]
     steps = [costs[i] for i in active]
+    # values of a slack combination s: origin + columns @ s, all exact
+    reach = max(abs(x) for x in origin) + sum(
+        max(abs(row[i]) for row in inverse) * (budget // costs[i]) for i in active)
+    dtype = np.int64 if reach < INT64_SAFE and denominator < INT64_SAFE else object
+    columns = np.array([[row[i] for i in active] for row in inverse], dtype=dtype)
+    base = np.array(origin, dtype=dtype)
+    # best-first over slack combinations; each one is generated once, from
+    # the combination with one less unit in its last used position, so
+    # the order (cost, slacks) is the same as over all neighbours
     zero = (0,) * len(active)
-    queue, seen = [(0, zero)], {zero}
+    queue = [(0, zero, 0)]
     examined = 0
     while queue:
-        cost, slacks = heapq.heappop(queue)
+        cost, slacks, last = heapq.heappop(queue)
         examined += 1
         if examined > max_candidates:
             return None
-        values = [x + sum(col[i] * s for col, s in zip(columns, slacks)) for i, x in enumerate(origin)]
-        if all(x % denominator == 0 for x in values):
-            point = [x // denominator for x in values]
+        values = base + columns @ np.array(slacks, dtype=dtype) if active else base
+        if not np.any(values % denominator):
+            point = [int(x) // denominator for x in values]
             weights, quota = point[:-1], point[-1]
             if quota >= 1 and min(weights) >= 0:
                 losing, winning = oracle.integer_extrema(weights)
                 if losing < quota <= winning:
                     return quota, weights
-        for i, step in enumerate(steps):
-            if cost + step <= budget:
+        for i in range(last, len(steps)):
+            following_cost = cost + steps[i]
+            if following_cost <= budget:
                 following = list(slacks)
                 following[i] += 1
-                following = tuple(following)
-                if following not in seen:
-                    seen.add(following)
-                    heapq.heappush(queue, (cost + step, following))
+                heapq.heappush(queue, (following_cost, tuple(following), i))
     return None
 
 
@@ -718,12 +898,17 @@ def _labelled_gap(quota, weights, upper):
     oracle = _Oracle(classes, diagram)
     clipped = [min(quota, v) for v in classes.values]
     common = reduce(gcd, clipped, 0)
-    solver = _ActiveSet(classes, oracle, [v // common for v in clipped], _ceil(Fraction(quota, common)))
-    if not solver.run():
-        return None
-    lam = solver.adj[solver.K - 1, :]
-    rows = [(key[1], key[0] == "W") for j, key in enumerate(solver.rows)
-            if key[0] in ("W", "L") and int(lam[j]) > 0]
+    rows = None
+    for guided in (False, True):     # the plain pivot path tends to end in a positive basis
+        start = [v // common for v in clipped]
+        solver = _ActiveSet(classes, oracle, start, _ceil(Fraction(quota, common)))
+        if not solver.run(guided=guided):
+            return None
+        lam = solver.adj[solver.K - 1, :]
+        rows = [(key[1], key[0] == "W") for j, key in enumerate(solver.rows)
+                if key[0] in ("W", "L") and int(lam[j]) > 0]
+        if len(rows) == classes.k + 1:
+            break                # a basis with strictly positive multipliers
     if len(rows) != classes.k + 1:
         return None
     try:
@@ -790,20 +975,6 @@ def minimum_quota(quota: int, weights: Sequence[int], *, max_pivots: int = 200_0
     upper = _ceil(Fraction(quota, common))
     lower, lp_bound, stage = 1, None, "trivial"
     if lower < upper:
-        rows = set()
-        rng = np.random.default_rng(len(weights))
-        for g in range(4):
-            guide = np.array(classes.values, dtype=float)
-            if g:
-                guide += rng.uniform(-1e-3, 1e-3, len(guide))
-            rows |= oracle.harvest(guide)
-        rows.add((bytes(classes.k), False))
-        proof = _direct_certificate(classes, sorted(rows), incumbent, upper)
-        if proof is not None and _ceil(proof[0]) > lower:
-            lower, stage = _ceil(proof[0]), "direct certificate"
-            if lower > upper:
-                raise AssertionError("direct proof contradicts the given representation")
-    if lower < upper:
         solver = _ActiveSet(classes, oracle, incumbent, upper)
         optimal = solver.run(max_pivots)
         if optimal:
@@ -817,7 +988,7 @@ def minimum_quota(quota: int, weights: Sequence[int], *, max_pivots: int = 200_0
             best = _round_candidates(classes, oracle, solver.X, solver.delta, qstar)
             if best is not None and best[0] < upper:
                 upper, incumbent = best[0], best[1]
-        stage = "active set"
+        stage = "certificate at the given weights" if optimal and not solver.moved else "active set"
         if lower > upper:
             raise AssertionError("active-set proof contradicts an integer representation")
     final_weights = classes.expand(incumbent)

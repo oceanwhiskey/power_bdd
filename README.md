@@ -248,15 +248,18 @@ idb.minimal()         # the same game with quota 394 ...
 idb.minimal().johnston().dp()    # ... quota-indexed methods become fast
 ```
 
-The computation needs no LP solver. Coalitions that are tight at the given
-weights are harvested from the winning QOBDD and turned into an exact lower
-bound; otherwise an exact simplex method moves on the polyhedron of all
-representations, with the ratio test as a dynamic program on the QOBDD and
-the inverse kept as an integer adjugate. When the LP bound and the best
-integer representation still differ (an *integer gap*, e.g. the IMF game of
-2002), all cheaper integer slack combinations of a positive basis are
-enumerated (games with at most 32 players). Floating point only proposes
-candidates; every bound is checked with exact integers.
+The computation needs no LP solver. An exact simplex method starts at the
+given weights and moves on the polyhedron of all representations, with the
+ratio test as a dynamic program on the QOBDD and the inverse kept as an
+integer adjugate. At every vertex, nonnegative least squares on the tight
+coalitions, with missing coalitions generated from the QOBDD, proposes the
+optimal basis directly; this skips the long runs of degenerate pivots and
+proves at the start that already minimal weights are minimal
+(`result.stage == "certificate at the given weights"`). When the LP bound
+and the best integer representation still differ (an *integer gap*, e.g.
+the IMF game of 2002), all cheaper integer slack combinations of a positive
+basis are enumerated (games with at most 32 players). Floating point only
+proposes candidates; every bound is checked with exact integers.
 
 ## Version 2
 
