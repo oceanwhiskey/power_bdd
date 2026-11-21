@@ -253,13 +253,18 @@ given weights and moves on the polyhedron of all representations, with the
 ratio test as a dynamic program on the QOBDD and the inverse kept as an
 integer adjugate. At every vertex, nonnegative least squares on the tight
 coalitions, with missing coalitions generated from the QOBDD, proposes the
-optimal basis directly; this skips the long runs of degenerate pivots and
-proves at the start that already minimal weights are minimal
+optimal basis directly. It is installed in one step (a rounded
+floating-point inverse, accepted only after an exact check) or, if its
+determinant is large, by pivots that do not move the point. This skips the
+long runs of degenerate pivots and proves at the start that already
+minimal weights are minimal
 (`result.stage == "certificate at the given weights"`). When the LP bound
 and the best integer representation still differ (an *integer gap*, e.g.
 the IMF game of 2002), all cheaper integer slack combinations of a positive
 basis are enumerated (games with at most 32 players). Floating point only
-proposes candidates; every bound is checked with exact integers.
+proposes candidates; every bound is checked with exact integers. Each of
+the 29 benchmark games of the paper, among them the IDB and IMF games,
+takes less than 0.6 s including the construction of the diagram.
 
 ## Version 2
 

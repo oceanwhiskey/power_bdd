@@ -160,9 +160,106 @@ def weighted_diagram(quota: int, weights: Sequence[int], order: Sequence[int]) -
     if quota > total:
         return constant_diagram(order, False)
     if quota <= BITSET_QUOTA_LIMIT:
+        # few reachable residual quotas (small n): cheaper than O(nq) bitsets
+        meet = _meet_in_the_middle(quota, level_weights, order, limit=max(256, quota >> 5))
+        if meet is not None:
+            return meet
         else_c, then_c, accepting = _bitset_levels(quota, level_weights)
+        reversed_levels = _reverse_canonical(else_c, then_c, accepting, order)
+        if reversed_levels is not None:
+            return reversed_levels
         return canonicalize(else_c, then_c, accepting, order)
+    meet = _meet_in_the_middle(quota, level_weights, order)
+    if meet is not None:
+        return meet
     return _interval_diagram(quota, level_weights, order)
+
+
+#: Largest point or interval set per level for the vectorized construction.
+MEET_LIMIT = 1 << 22
+
+
+def _meet_in_the_middle(q: int, weights: List[int], order: Sequence[int],
+                        limit: int = MEET_LIMIT):
+    """Vectorized construction for large quotas, or None if too wide.
+
+    From the root, the residual quotas reachable on each level are kept as
+    sorted point sets; from the terminals, the residual-quota line of each
+    level is cut into intervals of equal residual games (the refinement of
+    the next level's cut and its shift by the level weight).  The side
+    with fewer elements grows until both meet; there the points are looked
+    up in the intervals, and the result is reduced by :func:`canonicalize`.
+    Residual quotas are clipped to 0 (winning) and suffix + 1 (losing).
+    Requires ``0 < q <= sum(weights)``.
+    """
+    n = len(weights)
+    suffix = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + weights[i]
+    if suffix[0] >= (1 << 62) or n == 0:
+        return None
+
+    def clip(values, level):
+        return np.clip(values, 0, suffix[level] + 1)
+
+    def piece(starts, values):
+        return np.searchsorted(starts, values, side="right") - 1
+
+    points = {0: np.array([q], dtype=np.int64)}
+    starts = {n: np.array([0, 1], dtype=np.int64)}       # winning, losing terminal
+    pe, pt = {}, {}
+    top, bottom = 0, n
+    while top < bottom:
+        if len(points[top]) <= len(starts[bottom]):
+            r, w = points[top], weights[top]
+            points[top + 1] = np.unique(np.concatenate((clip(r, top + 1), clip(r - w, top + 1))))
+            top += 1
+            if len(points[top]) > limit:
+                return None
+        else:
+            i, below, w = bottom - 1, starts[bottom], weights[bottom - 1]
+            cand = np.unique(np.concatenate(([0], below, below + w, [suffix[i] + 1])))
+            cand = cand[cand <= suffix[i] + 1]
+            e = piece(below, clip(cand, i + 1))
+            t = piece(below, clip(cand - w, i + 1))
+            keep = np.ones(len(cand), dtype=bool)
+            keep[1:] = (e[1:] != e[:-1]) | (t[1:] != t[:-1])
+            starts[i], pe[i], pt[i] = cand[keep], e[keep], t[keep]
+            bottom = i
+            if len(starts[i]) > limit:
+                return None
+    m = top
+    else_c: List[np.ndarray] = [None] * n
+    then_c: List[np.ndarray] = [None] * n
+    for i in range(m):                      # point levels
+        r, w = points[i], weights[i]
+        if i + 1 < m:
+            else_c[i] = np.searchsorted(points[i + 1], clip(r, i + 1))
+            then_c[i] = np.searchsorted(points[i + 1], clip(r - w, i + 1))
+        else:
+            else_c[i] = piece(starts[m], clip(r, m))
+            then_c[i] = piece(starts[m], clip(r - w, m))
+    # interval levels: keep the intervals reachable from the meeting level
+    if m == 0:
+        reached = np.unique(piece(starts[0], np.array([q], dtype=np.int64)))
+    else:
+        reached = np.unique(np.concatenate((else_c[m - 1], then_c[m - 1])))
+    width = len(starts[m])
+    for i in range(m, n):
+        position = np.full(width, -1, dtype=np.int64)
+        position[reached] = np.arange(len(reached))
+        if i > 0:                           # level i - 1 points into level i
+            else_c[i - 1], then_c[i - 1] = position[else_c[i - 1]], position[then_c[i - 1]]
+        e, t = pe[i][reached], pt[i][reached]
+        else_c[i], then_c[i] = e, t
+        width = len(starts[i + 1])
+        reached = np.unique(np.concatenate((e, t)))
+    # terminal level: interval 0 wins, interval 1 loses
+    position = np.full(2, -1, dtype=np.int64)
+    position[reached] = np.arange(len(reached))
+    else_c[n - 1], then_c[n - 1] = position[else_c[n - 1]], position[then_c[n - 1]]
+    accepting = np.array([True, False])[reached]
+    return canonicalize(else_c, then_c, accepting, order)
 
 
 def _bitset_levels(q: int, weights: List[int]):
@@ -195,10 +292,7 @@ def _bitset_levels(q: int, weights: List[int]):
     def keys_of(nxt, residual):
         if nxt is None:
             return np.where(residual <= 0, 0, q + 1).astype(np.int64)
-        out = np.zeros_like(residual)
-        positive = residual > 0
-        out[positive] = nxt[residual[positive]]
-        return out
+        return nxt[np.maximum(residual, 0)]          # nxt[0] = 0: the empty suffix
 
     def reachable_keys(nxt, prefix, reach_true):
         keys = keys_of(nxt, q - np.flatnonzero(prefix).astype(np.int64))
@@ -236,6 +330,33 @@ def _bitset_levels(q: int, weights: List[int]):
         then_children.append(position[then_keys].copy())
         keys, nxt = child_keys, nxt_child
     return else_children, then_children, keys == 0
+
+
+def _reverse_canonical(else_children, then_children, accepting, order):
+    """Canonical form of bitset levels by reversing every level, if valid.
+
+    The bitset construction yields distinct residual games sorted by key,
+    with children nondecreasing in the key; the canonical order (sorted
+    child pairs, rejecting terminal first) is then the reverse order on
+    every level.  The pairs are checked to be strictly increasing; on
+    failure the caller falls back to :func:`canonicalize`.
+    """
+    accepting = np.asarray(accepting, dtype=bool)
+    width = len(accepting)
+    if not (width == 2 and accepting[0] and not accepting[1]):
+        return None
+    new_else, new_then = [None] * len(order), [None] * len(order)
+    for i in range(len(order) - 1, -1, -1):
+        e = (width - 1) - np.asarray(else_children[i], dtype=np.int64)[::-1]
+        t = (width - 1) - np.asarray(then_children[i], dtype=np.int64)[::-1]
+        if len(e) > 1:
+            de, dt = np.diff(e), np.diff(t)
+            if not np.all((de > 0) | ((de == 0) & (dt > 0))):
+                return None
+        new_else[i], new_then[i] = e, t
+        width = len(e)
+    return LevelDiagram(tuple(order), tuple(new_else), tuple(new_then),
+                        np.array([False, True]))
 
 
 def _interval_diagram(q: int, weights: List[int], order: Sequence[int]) -> LevelDiagram:
