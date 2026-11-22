@@ -9,6 +9,11 @@ any representation valid) on the polyhedron
 
 Its coalition rows are never listed; the winning QOBDD supplies them:
 
+0. *Start without a diagram.*  At the given weights (v, Q) a coalition is
+   tight exactly when it weighs Q or Q - 1, a subset-sum condition.  When
+   the diagram would be wide, subset-sum bitsets over the classes harvest
+   tight coalitions and an exact-sum knapsack generates columns, so that
+   already minimal weights are certified before any diagram is built.
 1. *Active set.*  An exact primal simplex on the implicit polyhedron
    starts at the given weights.  The inverse of the working rows is kept
    as an integer adjugate (Bareiss updates); the ratio test is an exact
@@ -17,13 +22,19 @@ Its coalition rows are never listed; the winning QOBDD supplies them:
    column generation from the diagram, proposes a dual solution, and its
    support is exchanged into the basis without moving the point; this
    skips the long runs of degenerate pivots at a degenerate optimum.  At
-   the LP optimum the multipliers prove ``q_min >= ceil(q*)``; rounded
-   optimal weights give an upper bound after an exact integer check.  If
-   the optimum is the start point, the given weights are already minimal.
-2. *Integer gap.*  If the bounds still differ, the active set runs on the
-   labelled game (one weight per player, at most 32 players); a basis with
-   strictly positive multipliers allows an exact enumeration of all cheaper
-   integer slack combinations.
+   the LP optimum the multipliers prove ``q_min >= ceil(q*)``.  The optimum
+   times the common denominator of its coordinates is a representation,
+   and rounded multiples of it give further upper bounds after an exact
+   integer check.
+2. *Integer gap.*  At an optimal basis of the labelled LP (one weight per
+   player), integer representations are the coset points of a lattice
+   whose quotient group has order delta (Gomory's group relaxation): a
+   shortest path in that group raises the lower bound.  The coset points
+   are then searched by cost in planes spanned by the (at most two)
+   cheapest generators: there the known rows cut out a polygon, whose
+   cheapest lattice point follows from Fourier-Motzkin elimination, and
+   every point that fails on the diagram adds the violated coalitions as
+   cutting planes.
 
 Floating point only proposes rows or multipliers; every bound is checked
 with exact integer arithmetic before it is reported.
@@ -31,6 +42,7 @@ with exact integer arithmetic before it is reported.
 from __future__ import annotations
 
 import heapq
+import random
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import reduce
@@ -39,7 +51,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ._diagram import LevelDiagram, weighted_diagram
+from ._diagram import LevelDiagram, _meet_in_the_middle, weighted_diagram
 
 INT64_SAFE = 1 << 60
 
@@ -178,6 +190,40 @@ class _Oracle:
         win, lose = self.extremes(list(class_weights), [0] * self.classes.k)
         return (-1 if lose is None else lose[0]), (float("inf") if win is None else win[0])
 
+    def extrema_many(self, weight_vectors) -> List[Tuple[int, float]]:
+        """:meth:`integer_extrema` for many class weight vectors in one pass.
+
+        int64 when every weight sum is below 2^60, else one exact pass each.
+        """
+        if not weight_vectors:
+            return []
+        mult = self.classes.multiplicities
+        if max(sum(abs(int(v)) * m for v, m in zip(w, mult)) for w in weight_vectors) >= INT64_SAFE:
+            return [self.integer_extrema(w) for w in weight_vectors]
+        width = max(len(e) for e in self.d.else_children)
+        chunk = max(1, (1 << 23) // width)
+        if len(weight_vectors) > chunk:
+            return [r for i in range(0, len(weight_vectors), chunk)
+                    for r in self.extrema_many(weight_vectors[i:i + chunk])]
+        count = len(weight_vectors)
+        weights = np.array([[int(v) for v in w] for w in weight_vectors], dtype=np.int64)
+        big = 1 << 62
+        acc = self.d.accepting.astype(bool)[:, None]
+        ones = np.ones(count, dtype=np.int64)
+        lightest = np.where(acc, 0, big) * ones          # over winning continuations
+        heaviest = np.where(acc, -big, 0) * ones         # over losing continuations
+        zero = np.zeros(count, dtype=np.int64)
+        for i in range(self.n - 1, -1, -1):
+            h = self.level_class[i]
+            kv = weights[:, h] if h >= 0 else zero
+            e, t = self.d.else_children[i], self.d.then_children[i]
+            lightest = np.minimum(lightest[e], lightest[t] + kv)
+            heaviest = np.maximum(heaviest[e], heaviest[t] + kv)
+        out = []
+        for lo, wi in zip(heaviest[0].tolist(), lightest[0].tolist()):
+            out.append((-1 if lo < -(1 << 61) else lo, float("inf") if wi > (1 << 61) else wi))
+        return out
+
     # -- harvesting --------------------------------------------------------------
     def _start_levels(self):
         """Levels where coalitions are harvested: the first and last level of
@@ -285,6 +331,249 @@ class _Oracle:
             if self.classes.classify(key) == winning:
                 rows.add((key, winning))
         return rows
+
+
+class _NeedDiagram(Exception):
+    """The subset-sum oracle cannot answer: the point has left the start."""
+
+
+class _Unbounded(Exception):
+    """A search plane is unbounded under the known rows."""
+
+
+#: Smallest n * quota for which the start is first certified without a diagram.
+SUBSET_START_WORK = 1 << 24
+#: Largest quota for the subset-sum bitsets.
+SUBSET_QUOTA_LIMIT = 1 << 24
+#: Diagrams with at most k q / (4 n) nodes per level count as narrow: they cost
+#: less to build and use than the subset-sum knapsacks over the k classes.
+#: A level has at most 2^min(i, n - i) nodes; beyond that the probe below
+#: tries at most this many points or intervals per level.
+SUBSET_PROBE_WIDTH = 1 << 12
+
+
+class _SubsetOracle:
+    """The oracle at the start point (v, Q) of an integer representation.
+
+    There, a coalition is tight exactly when its weight is Q (winning) or
+    Q - 1 (losing): a subset-sum condition.  Prefix and suffix bitsets of
+    attainable class sums (the coefficients of prod (1 + z^v + ... + z^(m v))
+    over GF(2)) give tight coalitions for :meth:`harvest`, and an exact-sum
+    knapsack over the classes answers :meth:`extremes` while the point is
+    the start.  Anything else raises :class:`_NeedDiagram`, and the caller
+    falls back to the QOBDD.  No diagram is built.
+    """
+
+    def __init__(self, classes: _Classes, start, quota: int, max_calls: int = 32):
+        self.classes = classes
+        self.v = [int(x) for x in start]
+        self.Q = int(quota)
+        self.m = list(classes.multiplicities)
+        self.calls, self.max_calls = 0, max_calls
+        k, Q, v, m = classes.k, self.Q, self.v, self.m
+        mask = (1 << (Q + 1)) - 1
+        prefix = [1]                             # bit p: sum p from classes < h
+        for h in range(k):
+            cur, acc = prefix[-1], prefix[-1]
+            for t in range(1, m[h] + 1):
+                acc |= cur << (t * v[h])
+            prefix.append(acc & mask)
+        mirrored = [0] * k + [1 << Q]            # bit Q - s: sum s from classes >= h
+        for h in range(k - 1, -1, -1):
+            cur, acc = mirrored[h + 1], mirrored[h + 1]
+            for t in range(1, m[h] + 1):
+                acc |= cur >> (t * v[h])
+            mirrored[h] = acc
+        size = Q // 8 + 2
+        self.prefix, self.mirrored = prefix, mirrored
+        self.prefix_bits = [np.frombuffer(x.to_bytes(size, "little"), dtype=np.uint8) for x in prefix]
+        self.mirrored_bits = [np.frombuffer(x.to_bytes(size, "little"), dtype=np.uint8) for x in mirrored]
+
+    def without_dummies(self) -> bool:
+        """True if every class is essential: some coalition without one of its
+        members weighs between Q - v_h and Q - 1, so that member can swing."""
+        v, m = self.v, self.m          # Q enters through the mirrored bits
+        for h in range(self.classes.k):
+            sums = 0                              # prefix plus up to m_h - 1 members of h
+            for t in range(m[h]):
+                sums |= self.prefix[h] << (t * v[h])
+            window, span = sums << 1, 1           # bits x + 1 .. x + v_h
+            while span < v[h]:
+                step = min(span, v[h] - span)
+                window |= window << step
+                span += step
+            if not window & self.mirrored[h + 1]:
+                return False
+        return True
+
+    def _coalitions(self, requests):
+        """Tight coalitions through a fixed choice on a level, as the diagram harvest.
+
+        A request (h, last, bit, target) fixes one player of class h, on the
+        first level of its run (``last`` False: the other m_h - 1 members
+        follow in the suffix) or on the last one (they precede it in the
+        prefix), in or out by ``bit``.  The prefix sum is the largest one
+        that can be completed to ``target``; the prefix is traced back with
+        the smallest counts first and the suffix with the largest counts
+        first, for all requests at once.
+        """
+        k, Q, v, m = self.classes.k, self.Q, self.v, self.m
+        mask = (1 << (Q + 1)) - 1
+        partial_prefix, partial_suffix = {}, {}
+        found = []
+        for h, last, bit, target in requests:
+            if last:
+                if h not in partial_prefix:
+                    acc = 0
+                    for t in range(m[h]):
+                        acc |= self.prefix[h] << (t * v[h])
+                    partial_prefix[h] = acc & mask
+                left, right = partial_prefix[h], self.mirrored[h + 1]
+            else:
+                if h not in partial_suffix:
+                    acc = 0
+                    for t in range(m[h]):
+                        acc |= self.mirrored[h + 1] >> (t * v[h])
+                    partial_suffix[h] = acc
+                left, right = self.prefix[h], partial_suffix[h]
+            options = left & (right >> ((Q - target) + bit * v[h]))
+            if options:
+                found.append((h, last, bit, target, options.bit_length() - 1))
+        if not found:
+            return []
+        count = len(found)
+        level = np.array([f[0] for f in found])
+        last = np.array([f[1] for f in found], dtype=bool)
+        counts = np.zeros((count, k), dtype=np.int64)
+        counts[np.arange(count), level] = [f[2] for f in found]
+        cap = np.array(m, dtype=np.int64)
+
+        def trace(rest, active_of, bits_of, flip, upwards):
+            for g in (range(k - 1, -1, -1) if flip else range(k)):
+                active = active_of(g)
+                if not active.any():
+                    continue
+                limit = np.where(level == g, cap[g] - 1, cap[g])
+                bits = bits_of(g)
+                chosen = np.full(count, -1, dtype=np.int64)
+                for c in (range(0, m[g] + 1) if upwards else range(m[g], -1, -1)):
+                    r = rest - c * v[g]
+                    ok = active & (chosen < 0) & (r >= 0) & (c <= limit)
+                    idx = np.where(ok, r if flip else Q - r, 0)
+                    ok &= ((bits[idx >> 3] >> (idx & 7)) & 1).astype(bool)
+                    chosen[ok] = c
+                take = active & (chosen > 0)
+                counts[take, g] += chosen[take]
+                rest[take] -= chosen[take] * v[g]
+            return rest
+
+        # prefix: classes < h, and class h itself when the level is the last of its run
+        trace(np.array([f[4] for f in found], dtype=np.int64),
+              lambda g: (level > g) | ((level == g) & last), lambda g: self.prefix_bits[g],
+              flip=True, upwards=True)
+        # suffix: classes > h, and class h itself when the level is the first of its run
+        trace(np.array([f[3] - f[4] - f[2] * v[f[0]] for f in found], dtype=np.int64),
+              lambda g: (level < g) | ((level == g) & ~last), lambda g: self.mirrored_bits[g + 1],
+              flip=False, upwards=False)
+        weights = counts @ np.array(v, dtype=np.int64)
+        if (not np.array_equal(weights, np.array([f[3] for f in found], dtype=np.int64))
+                or (counts > cap).any()):
+            raise AssertionError("subset-sum reconstruction failed")
+        return [(bytes(row.astype(np.uint8)), f[3] == Q) for row, f in zip(counts, found)]
+
+    def harvest(self, class_weights) -> set:
+        """Tight coalitions through each choice on the first and the last level
+        of every class run, for both outcomes: the rows of the diagram harvest,
+        whose pool tends to give bases with small determinants."""
+        if [int(x) for x in class_weights] != self.v:
+            raise _NeedDiagram
+        requests = [(h, last, bit, target) for h in range(self.classes.k)
+                    for last in ((False, True) if self.m[h] > 1 else (False,))
+                    for bit in (0, 1) for target in (self.Q, self.Q - 1)]
+        return set(self._coalitions(requests))
+
+    def extremes(self, P, S):
+        """Lexicographic extremes of (c.v, c.S) among the tight coalitions."""
+        if [int(x) for x in P] != self.v:
+            raise _NeedDiagram
+        self.calls += 1
+        if self.calls > self.max_calls:
+            raise _NeedDiagram
+        S = [int(x) for x in S]
+        if sum(abs(s) * m for s, m in zip(S, self.m)) >= INT64_SAFE:
+            raise _NeedDiagram
+        win = self._exact(S, self.Q, maximize=False)
+        lose = self._exact(S, self.Q - 1, maximize=True)
+        return ((self.Q, win[0], win[1]) if win else None,
+                (self.Q - 1, lose[0], lose[1]) if lose else None)
+
+    def _exact(self, S, target, maximize):
+        """Best c.S over counts c (0 <= c_h <= m_h) with c.v = target (binary splitting).
+
+        Unreachable sums start at -+2^62 and stay beyond -+2^61, since every
+        sum of values is below 2^60 in size (checked by the caller); so the
+        sentinel needs no mask, and a step is one in-place min or max.  A
+        take bit set at an unreachable sum is never followed back.
+        """
+        if target < 0:
+            return None
+        none = -(1 << 62) if maximize else (1 << 62)
+        best = np.full(target + 1, none, dtype=np.int64)
+        best[0] = 0
+        items, takes = [], []
+        for h in range(self.classes.k):
+            left, piece = self.m[h], 1
+            while left > 0:
+                p = min(piece, left)
+                left -= p
+                piece *= 2
+                w = p * self.v[h]
+                if w > target:
+                    continue
+                moved = best[:target + 1 - w] + p * S[h]
+                here = best[w:]
+                if maximize:
+                    better = moved > here
+                    np.maximum(here, moved, out=here)
+                else:
+                    better = moved < here
+                    np.minimum(here, moved, out=here)
+                items.append((h, p, w))
+                takes.append(np.packbits(better))
+        if abs(int(best[target])) > (1 << 61):
+            return None
+        counts, s = [0] * self.classes.k, target
+        for (h, p, w), packed in zip(reversed(items), reversed(takes)):
+            i = s - w
+            if i >= 0 and (packed[i >> 3] >> (7 - (i & 7))) & 1:
+                counts[h] += p
+                s -= w
+        if s != 0 or sum(c * x for c, x in zip(counts, self.v)) != target:
+            raise AssertionError("exact-sum reconstruction failed")
+        return int(best[target]), bytes(counts)
+
+
+def _certify_start(classes: _Classes, start, quota: int) -> Optional[Fraction]:
+    """q* = quota proven at the start (v, quota) without a diagram, or None."""
+    if quota > SUBSET_QUOTA_LIMIT or max(classes.multiplicities) > 255:
+        return None
+    oracle = _SubsetOracle(classes, start, quota, max_calls=8)
+    if not oracle.without_dummies():
+        return None                               # the diagram path removes them
+    solver = _ActiveSet(classes, oracle, start, quota)
+    solver.bland = False
+    try:                                          # one guided switch, then pricing
+        solver.harvest()
+        solver.guided_switch()
+        if solver.price() is not None:
+            return None
+    except _NeedDiagram:
+        return None
+    qstar = solver.value()
+    proof = solver.certificate()
+    if proof is None or proof[0] != qstar or qstar != quota:
+        return None
+    return qstar
 
 
 # ---------------------------------------------------------------------------
@@ -920,181 +1209,588 @@ def _nnls(E, f, start=None, tol=1e-10, max_iterations=None):
 
 
 def _round_candidates(classes, oracle, X, delta, qstar):
-    lower = _ceil(qstar)
-    xs = [Fraction(int(x), delta) for x in X[:classes.k]]
-    scales = [Fraction(1)] if qstar.denominator == 1 else [Fraction(1), Fraction(lower) / qstar]
+    """The best integer representation found near the LP optimum (x*, q*).
+
+    (x*, q*) times the common denominator D of its coordinates is always a
+    representation: winning rows keep their margin 0, losing rows get the
+    margin D >= 1.  Besides it, x* and ceil(q*)/q* x* are rounded (nearest,
+    down, up); one batched pass checks all candidates.  Returns (quota,
+    class weights) or None.
+    """
+    k = classes.k
+    X = [int(v) for v in X]
+    common = reduce(gcd, X, int(delta))
+    num = [v // common for v in X]                 # D (x*; q*)
+    qn, den = num[k], int(delta) // common         # D q*, D
+    candidates = {tuple(num[:k])}
+    scales = [(qn, den)] + ([(_ceil(qstar), 1)] if qstar.denominator != 1 else [])
+    for P, R in scales:                            # P num_h / (R qn) = (P / (R q*)) x*_h
+        B = qn * R
+        a = [v * P for v in num[:k]]
+        candidates.add(tuple((2 * x + B) // (2 * B) for x in a))
+        candidates.add(tuple(x // B for x in a))
+        candidates.add(tuple(-(-x // B) for x in a))
+    pool = [list(w) for w in candidates if min(w) >= 0]
     best = None
-    seen = set()
-    for s in scales:
-        for mode in ("round", "floor", "ceil"):
-            w = []
-            for x in xs:
-                y = x * s
-                if mode == "floor":
-                    w.append(y.numerator // y.denominator)
-                elif mode == "ceil":
-                    w.append(_ceil(y))
-                else:
-                    w.append((2 * y.numerator + y.denominator) // (2 * y.denominator))
-            w = tuple(max(0, v) for v in w)
-            if w in seen:
-                continue
-            seen.add(w)
-            losing, winning = oracle.integer_extrema(list(w))
-            if losing < winning and (best is None or losing + 1 < best[0]):
-                best = (losing + 1, list(w))
+    for w, (losing, winning) in zip(pool, oracle.extrema_many(pool)):
+        if losing < winning and (best is None or losing + 1 < best[0]):
+            best = (losing + 1, w)
     return best
 
 
 # ---------------------------------------------------------------------------
-# integer gap: positive labelled basis and slack enumeration
+# integer gap: Gomory's group relaxation at the optimal labelled basis
 # ---------------------------------------------------------------------------
 
-def _integer_inverse(matrix):
-    """(N, D) with A N = D I, D > 0, by fraction-free Gauss-Jordan."""
-    n = len(matrix)
-    a = [list(row) + [int(i == j) for j in range(n)] for i, row in enumerate(matrix)]
-    previous = 1
-    for k in range(n):
-        candidates = [i for i in range(k, n) if a[i][k]]
-        if not candidates:
-            raise ValueError("singular basis")
-        pivot_row = min(candidates, key=lambda i: abs(a[i][k]))
-        a[k], a[pivot_row] = a[pivot_row], a[k]
-        pivot = a[k][k]
-        for i in range(n):
-            if i == k:
-                continue
-            factor = a[i][k]
-            for j in range(2 * n):
-                if j != k:
-                    value, remainder = divmod(pivot * a[i][j] - factor * a[k][j], previous)
-                    if remainder:
-                        raise ArithmeticError("fraction-free division was not exact")
-                    a[i][j] = value
-            a[i][k] = 0
-        previous = pivot
-    denominator = a[0][0]
-    numerator = [row[n:] for row in a]
-    if denominator < 0:
-        denominator, numerator = -denominator, [[-x for x in row] for row in numerator]
-    for i in range(n):
-        for j in range(n):
-            if sum(matrix[i][k] * numerator[k][j] for k in range(n)) != denominator * (i == j):
-                raise ArithmeticError("integer inverse identity failed")
-    return numerator, denominator
+#: Largest order of the quotient group for the group bound ...
+GROUP_LIMIT = 1 << 20
+#: ... and for listing the coset points.
+GROUP_SEARCH_LIMIT = 1 << 16
+#: Largest product of basis size and group order (the cost of the bound).
+GROUP_WORK_LIMIT = 1 << 25
+#: The second cheapest generator joins the search plane when it costs at
+#: most 1/PLANE_RATIO of the third.
+PLANE_RATIO = 16
+_INF = 1 << 61
 
 
-def _satisfies(known, point) -> bool:
-    """A point >= b for the known valid rows (a cheap necessary test)."""
-    matrix, rhs = known
-    values = _ActiveSet._matvec(matrix, point)
-    return bool(np.all(values >= rhs))
+class _Group:
+    """Gomory's group relaxation at an optimal basis of the labelled LP.
 
+    Every integer representation z = (w, q) has integer slacks s = A z - b
+    on the rows A of the basis: s_j >= 0 for coalition and sign rows, free
+    for a temporary row.  z = adj (b + s) / delta is integral exactly when
+    adj s = -adj b (mod delta), so s lies in one coset of the lattice A Z^K,
+    whose quotient group has order delta.  With the optimal multipliers
+    lam_j = adj[q, j] >= 0, the quota is (lam.b + lam.s) / delta.
 
-def _positive_basis_enumeration(oracle, rows, quota_upper, max_candidates=100_000, known=None):
-    """Search every cheaper integer slack combination of a positive basis.
-
-    ``rows`` are n+1 labelled coalitions (counts over levels, winning).
-    ``known`` optionally gives valid rows (A, b) with A [w; q] >= b for
-    every representation, used to reject candidates before the exact
-    check on the diagram.  Returns (quota, level weights) or None.
+    A cheapest coset point, a shortest path in the Cayley graph of the
+    quotient, bounds q_min from below (:meth:`bound`); listing the coset
+    points by cost and checking each on the diagram finds q_min
+    (:meth:`search`).  The quotient is used as Z/delta when a linear map
+    onto Z/delta exists (then it is an isomorphism, since the orders
+    agree), otherwise as tuples when delta is small.
     """
-    n = oracle.classes.k
-    matrix, right = [], []
-    for counts, winning in rows:
-        sign = 1 if winning else -1
-        matrix.append([sign * c for c in counts] + [-sign])
-        right.append(int(not winning))
-    inverse, denominator = _integer_inverse(matrix)
-    costs = inverse[-1]
-    if any(x <= 0 for x in costs):
-        return None
-    origin = [sum(x * b for x, b in zip(row, right)) for row in inverse]
-    budget = quota_upper * denominator - origin[-1]
-    if budget < 0:
-        return None
-    # positions sorted by cost, so that siblings come in nondecreasing cost
-    active = sorted((i for i, cost in enumerate(costs) if cost <= budget),
-                    key=lambda i: (costs[i], i))
-    steps = [costs[i] for i in active]
-    # values of a slack combination s: origin + columns @ s, all exact
-    reach = max(abs(x) for x in origin) + sum(
-        max(abs(row[i]) for row in inverse) * (budget // costs[i]) for i in active)
-    dtype = np.int64 if reach < INT64_SAFE and denominator < INT64_SAFE else object
-    columns = np.array([[row[i] for i in active] for row in inverse], dtype=dtype)
-    base = np.array(origin, dtype=dtype)
-    # best-first in order of cost over the tree in which a combination's
-    # parent has one unit less in its last used position; children are
-    # generated lazily (first child, then the next sibling), so every
-    # examined combination adds at most two entries to the queue
-    count = len(active)
-    queue = [(0, 0, (0,) * count, -1)]
-    pushed = examined = 0
-    while queue:
-        cost, _, slacks, j = heapq.heappop(queue)
-        examined += 1
-        if examined > max_candidates:
-            return None
-        # the quota coordinate is origin[-1] + cost: test it before the rest
-        if (origin[-1] + cost) % denominator == 0:
-            values = base + columns @ np.array(slacks, dtype=dtype) if count else base
-            if not np.any(values % denominator):
-                point = [int(x) // denominator for x in values]
-                weights, quota = point[:-1], point[-1]
-                if quota >= 1 and min(weights) >= 0 and (
-                        known is None or _satisfies(known, point)):
-                    losing, winning = oracle.integer_extrema(weights)
-                    if losing < quota <= winning:
-                        return quota, weights
-        first = max(j, 0)
-        if first < count and cost + steps[first] <= budget:      # first child
-            child = list(slacks)
-            child[first] += 1
-            pushed += 1
-            heapq.heappush(queue, (cost + steps[first], pushed, tuple(child), first))
-        if 0 <= j < count - 1:                                  # next sibling
-            sibling_cost = cost - steps[j] + steps[j + 1]
-            if sibling_cost <= budget:
-                sibling = list(slacks)
-                sibling[j] -= 1
-                sibling[j + 1] += 1
-                pushed += 1
-                heapq.heappush(queue, (sibling_cost, pushed, tuple(sibling), j + 1))
-    return None
+
+    def __init__(self, solver):
+        self.ok = False
+        K, d = solver.K, int(solver.delta)
+        self.K, self.d = K, d
+        if d > GROUP_LIMIT or K * d > GROUP_WORK_LIMIT:
+            return
+        adj = [[int(v) for v in row] for row in solver.adj.tolist()]
+        b = [int(v) for v in solver.b]
+        costs = adj[K - 1]
+        free = [key[0] == "F" for key in solver.rows]
+        if any(c < 0 for c in costs) or any(f and c for f, c in zip(free, costs)):
+            return                                    # not an optimal basis
+        if max(costs) * 2 * d >= _INF:
+            return
+        self.adj, self.b, self.costs, self.free = adj, b, costs, free
+        self.qnum = sum(c * v for c, v in zip(costs, b))          # delta * q*
+        columns = [[adj[i][j] % d for i in range(K)] for j in range(K)]
+        target = [(-sum(adj[i][j] * b[j] for j in range(K))) % d for i in range(K)]
+        self.ok = self._encode(columns, target)
+
+    # -- the quotient group ----------------------------------------------------
+    def _encode(self, columns, target) -> bool:
+        d, K = self.d, self.K
+        rng = random.Random(d)
+        for _ in range(16):
+            u = [rng.randrange(d) for _ in range(K)]
+            steps = [sum(a * b for a, b in zip(u, col)) % d for col in columns]
+            if gcd(reduce(gcd, steps, 0), d) == 1:     # onto Z/d, hence bijective
+                self.cyclic = True
+                self.steps = steps
+                self.target = sum(a * b for a, b in zip(u, target)) % d
+                self.rest = (self.target - np.arange(d, dtype=np.int64)) % d
+                return True
+        if d > 4096:
+            return False
+        zero = (0,) * K                                # tuples, by breadth-first search
+        index, elements, queue = {zero: 0}, [zero], [zero]
+        while queue:
+            nxt = []
+            for e in queue:
+                for col in columns:
+                    t = tuple((x + y) % d for x, y in zip(e, col))
+                    if t not in index:
+                        index[t] = len(elements)
+                        elements.append(t)
+                        nxt.append(t)
+            queue = nxt
+        if len(elements) != d:
+            return False
+        self.cyclic = False
+        self.perm = [np.array([index[tuple((x + y) % d for x, y in zip(e, col))] for e in elements],
+                              dtype=np.int64) for col in columns]
+        self.target = index[tuple(target)]
+        self.rest = np.array([index[tuple((t - x) % d for t, x in zip(target, e))] for e in elements],
+                             dtype=np.int64)
+        return True
+
+    def _step(self, g: int, j: int) -> int:
+        return (g + self.steps[j]) % self.d if self.cyclic else int(self.perm[j][g])
+
+    def _cycles(self, j: int) -> np.ndarray:
+        """The elements of the group, one row per cycle of adding generator j."""
+        d = self.d
+        if self.cyclic:
+            g = gcd(self.steps[j], d)
+            order = d // g
+            return (np.arange(g, dtype=np.int64)[:, None]
+                    + self.steps[j] * np.arange(order, dtype=np.int64)[None, :]) % d
+        perm, seen, rows = self.perm[j], np.zeros(d, dtype=bool), []
+        for start in range(d):
+            if not seen[start]:
+                cycle, x = [], start
+                while not seen[x]:
+                    seen[x] = True
+                    cycle.append(x)
+                    x = int(perm[x])
+                rows.append(cycle)
+        return np.array(rows, dtype=np.int64)
+
+    def _close(self, D: np.ndarray, j: int) -> np.ndarray:
+        """min over t >= 0 of D(x - t g_j) + t cost_j (t in Z when the row is free)."""
+        idx = self._cycles(j)
+        values = D[idx]
+        if self.free[j]:
+            closed = np.repeat(values.min(axis=1, keepdims=True), idx.shape[1], axis=1)
+        else:
+            order = idx.shape[1]
+            ramp = np.arange(2 * order, dtype=np.int64) * self.costs[j]
+            both = np.concatenate((values, values), axis=1) - ramp
+            closed = np.minimum(np.minimum.accumulate(both, axis=1) + ramp, _INF)[:, order:]
+        out = np.empty_like(D)
+        out[idx] = closed
+        return out
+
+    # -- bound and search ----------------------------------------------------
+    def bound(self) -> int:
+        """ceil((delta q* + gamma) / delta) for the cheapest coset point gamma."""
+        D = np.full(self.d, _INF, dtype=np.int64)
+        D[0] = 0
+        for j in range(self.K):
+            D = self._close(D, j)
+        gamma = int(D[self.target])
+        return -(-(self.qnum + gamma) // self.d)
+
+    @property
+    def searchable(self) -> bool:
+        """At most two directions without cost (free or with zero multiplier):
+        they span the plane of the search."""
+        return self.ok and sum(c == 0 for c in self.costs) <= 2 and self.d <= GROUP_SEARCH_LIMIT
+
+    def search(self, oracle, classes, upper, known=None, limit=10_000, work=400_000):
+        """The cheapest valid coset point with quota below ``upper``.
+
+        Returns ("found", (q, weights)), which is q_min; ("optimal", None) if
+        no representation has a quota below ``upper``; or ("bound", lower)
+        when ``limit`` passes over the diagram or ``work`` queue entries were
+        spent, every point cheaper than ``lower`` being invalid.
+
+        The r <= 2 cheapest generators (all zero-cost ones, and the cheapest
+        positive one when it is far cheaper than the next) span a plane; the
+        others form multisets rho.  On the plane of rho every coalition row
+        is linear in (t_0, t_1), so the known rows cut out a polygon, and the
+        coset condition a lattice.  The cheapest lattice point of the
+        polygon is found exactly: Fourier-Motzkin elimination of t_0 gives
+        the range of t_1, and a convex lower bound of the cost in t_1 limits
+        the t_1 that are tried.  If the point fails on the diagram, the
+        violated coalitions join the rows (cutting planes).  The multisets
+        rho are listed by A*, with group distances as completion bound, and
+        planes wait in the same queue under their current least cost, so the
+        first valid point to leave the queue is optimal.
+        """
+        K, d, costs, k, free = self.K, self.d, self.costs, classes.k, self.free
+        budget = (upper - 1) * d - self.qnum
+        if budget < 0:
+            return "optimal", None
+        order = sorted(range(K), key=lambda j: (costs[j], j))
+        r = max(1, sum(c == 0 for c in costs))
+        if r == 1 and K >= 3 and costs[order[1]] * PLANE_RATIO <= costs[order[2]]:
+            r = 2
+        r = min(r, K)
+        plane = order[:r]
+        c = [costs[j] for j in plane] + [0] * (2 - r)
+        lower_t = [None if free[j] else 0 for j in plane] + [0] * (2 - r)
+        cyclic = self.cyclic
+        steps = self.steps if cyclic else None
+        perm = None if cyclic else [q.tolist() for q in self.perm]
+        back = None
+        if not cyclic and r == 2:
+            back = [0] * d
+            for x, y in enumerate(perm[plane[1]]):
+                back[y] = x
+
+        def step(g, j):
+            return (g + steps[j]) % d if cyclic else perm[j][g]
+
+        def minus1(g):
+            return (g - steps[plane[1]]) % d if cyclic else back[g]
+
+        dlog, x, t = [-1] * d, 0, 0            # t with t g_0 = e, for e in <g_0>
+        while dlog[x] < 0:
+            dlog[x] = t
+            x, t = step(x, plane[0]), t + 1
+        period = t
+        length = 1                             # order of g_1 (1 without a second direction)
+        if r == 2:
+            x = step(0, plane[1])
+            while x != 0:
+                x, length = step(x, plane[1]), length + 1
+        residues = {}
+
+        def residue_table(e):
+            """For u = t_1 mod ord g_1: t_0 mod ord g_0, or -1 if no t_0 fits."""
+            if e not in residues:
+                table, x = [], e
+                for _ in range(length):
+                    table.append(dlog[x])
+                    if r == 2:
+                        x = minus1(x)
+                residues[e] = np.array(table, dtype=np.int64)
+            return residues[e]
+
+        D = np.full(d, _INF, dtype=np.int64)
+        D[0] = 0
+        for j in plane:
+            D = self._close(D, j)
+        dist = [None] * (K + 1)
+        dist[K] = D
+        for p in range(K - 1, r - 1, -1):
+            D = self._close(D, order[p])
+            dist[p] = D
+        dist = [None if D is None else D.tolist() for D in dist]
+        rest = self.rest.tolist()
+
+        # rows a.z >= b become Gamma s >= beta in slack coordinates (sorted positions)
+        adj, b = self.adj, self.b
+        origin = [sum(adj[i][j] * b[j] for j in range(K)) for i in range(K)]
+        columns = [[adj[i][order[p]] for i in range(K)] for p in range(K)]
+        reach = budget // max(1, min((v for v in costs if v > 0), default=1)) + 1
+        rows = {"G": None, "beta": None, "n": 0, "kind": np.int64}
+
+        def add_row(a, rhs):
+            g = [sum(x * y for x, y in zip(a, col)) for col in columns]
+            bv = d * rhs - sum(x * y for x, y in zip(a, origin))
+            n, G = rows["n"], rows["G"]
+            if rows["kind"] is np.int64 and max(abs(v) for v in g) * reach * K * 4 + abs(bv) >= INT64_SAFE:
+                rows["kind"] = object
+                if G is not None:
+                    rows["G"], rows["beta"] = G.astype(object), rows["beta"].astype(object)
+            if G is None or n == len(rows["G"]):
+                size = max(64, 2 * n)
+                G2 = np.zeros((size, K), dtype=rows["kind"])
+                b2 = np.zeros(size, dtype=rows["kind"])
+                if n:
+                    G2[:n], b2[:n] = rows["G"][:n], rows["beta"][:n]
+                rows["G"], rows["beta"] = G2, b2
+            rows["G"][n], rows["beta"][n] = g, bv
+            rows["n"] = n + 1
+
+        for h in range(K):                     # w_h >= 0 and q >= 1
+            add_row([int(i == h) for i in range(K)], int(h == k))
+        for h, value in enumerate(classes.values):
+            if value < classes.quota:          # a losing single player: w_h <= q - 1
+                add_row([-int(i == h) for i in range(k)] + [1], 1)
+        if known is not None:
+            for a, rhs in zip(known[0].tolist(), known[1].tolist()):
+                add_row(a, rhs)
+
+        def ceil_div(a, b):
+            return -((-a) // b)
+
+        def plane_point(s, cost, e):
+            """Cheapest (t0, t1) on the plane of s under the known rows: (value, t0, t1)."""
+            spare = budget - cost
+            if spare < 0:
+                return None
+            table = residue_table(e)
+            if not (table >= 0).any():
+                return None
+            n = rows["n"]
+            G, bet = rows["G"][:n], rows["beta"][:n]
+            used = [p for p in range(r, K) if s[p]]
+            need = bet - G[:, used] @ np.array([s[p] for p in used], dtype=G.dtype) if used else bet.copy()
+            a0 = G[:, 0]
+            a1 = G[:, 1] if r == 2 else np.zeros(n, dtype=G.dtype)
+            extra_a0, extra_a1, extra_n = [], [], []
+            if lower_t[0] is not None:
+                extra_a0.append(1), extra_a1.append(0), extra_n.append(0)
+            if c[0] or c[1]:
+                extra_a0.append(-c[0]), extra_a1.append(-c[1]), extra_n.append(-spare)
+            if extra_a0:
+                kind = G.dtype
+                a0 = np.concatenate((a0, np.array(extra_a0, dtype=kind)))
+                a1 = np.concatenate((a1, np.array(extra_a1, dtype=kind)))
+                need = np.concatenate((need, np.array(extra_n, dtype=kind)))
+            if a0.dtype != object:             # products of two rows must stay exact
+                top = max(int(np.abs(a0).max()), int(np.abs(a1).max()), 1)
+                if top * (top + int(np.abs(need).max())) * 4 >= INT64_SAFE:
+                    a0, a1, need = a0.astype(object), a1.astype(object), need.astype(object)
+            pos, neg, flat = a0 > 0, a0 < 0, a0 == 0
+            lo1, hi1 = lower_t[1], None        # range of t_1
+            for coef, rhs in ((a1[flat], need[flat]),) + (
+                    ((a1[pos][:, None] * -a0[neg][None, :] + a1[neg][None, :] * a0[pos][:, None]).ravel(),
+                     (need[pos][:, None] * -a0[neg][None, :] + need[neg][None, :] * a0[pos][:, None]).ravel()),):
+                if not len(coef):
+                    continue
+                if np.any(rhs[coef == 0] > 0):
+                    return None
+                up, down = coef > 0, coef < 0
+                if up.any():
+                    v = int(ceil_div(rhs[up], coef[up]).max())
+                    lo1 = v if lo1 is None else max(lo1, v)
+                if down.any():
+                    v = int((rhs[down] // coef[down]).min())
+                    hi1 = v if hi1 is None else min(hi1, v)
+            if r == 1:
+                lo1, hi1 = 0, 0
+            if lo1 is None or hi1 is None:
+                raise _Unbounded
+            if lo1 > hi1:
+                return None
+            P0, P1, PN = a0[pos], a1[pos], need[pos]
+            M0, M1, MN = a0[neg], a1[neg], need[neg]
+
+            def evaluate(T):
+                """Exact least cost and t0 for the t1 in T (inf where none fits)."""
+                T = np.asarray(T, dtype=a0.dtype)
+                if len(P0):
+                    lo = ceil_div(PN[:, None] - P1[:, None] * T[None, :], P0[:, None]).max(axis=0)
+                else:
+                    lo = np.full(len(T), -(1 << 62), dtype=a0.dtype)
+                lo = np.asarray(lo)
+                res = table[(T % length).astype(np.int64)]
+                t0 = lo + (res - lo) % period
+                ok = res >= 0
+                if len(M0):
+                    hi = ((MN[:, None] - M1[:, None] * T[None, :]) // M0[:, None]).min(axis=0)
+                    ok &= t0 <= hi
+                value = np.where(ok, c[0] * t0 + c[1] * T, _INF)
+                return value, t0
+
+            def bound(t1):
+                """Convex lower bound of the cost at t1 (t0 at its real lower limit)."""
+                if not len(P0) or c[0] == 0:
+                    return c[1] * t1
+                return c[1] * t1 + c[0] * max(Fraction(int(n_) - int(p1) * t1, int(p0))
+                                              for p0, p1, n_ in zip(P0, P1, PN))
+
+            if c[0] == 0:                      # cost grows with t1 (or is constant): first fit
+                start = lo1
+                while start <= hi1:
+                    T = np.arange(start, min(hi1, start + 4095) + 1)
+                    value, t0 = evaluate(T)
+                    hit = np.flatnonzero(value < _INF)
+                    if len(hit):
+                        i = int(hit[0])
+                        return int(value[i]), int(t0[i]), int(T[i])
+                    start += 4096
+                return None
+            a, b_ = lo1, hi1                   # minimum of the convex bound (ternary search)
+            while b_ - a > 2:
+                m1, m2 = a + (b_ - a) // 3, b_ - (b_ - a) // 3
+                if bound(m1) <= bound(m2):
+                    b_ = m2
+                else:
+                    a = m1
+            centre = min(range(a, b_ + 1), key=bound)
+            best = None
+            left, right = centre, centre - 1
+            width = 256
+            while True:                        # widen while the bound can still beat the best
+                grow_left = left > lo1 and (best is None or bound(left - 1) < best[0])
+                grow_right = right < hi1 and (best is None or bound(right + 1) < best[0])
+                if not grow_left and not grow_right:
+                    break
+                chunk = []
+                if grow_left:
+                    new_left = max(lo1, left - width)
+                    chunk.extend(range(new_left, left))
+                    left = new_left
+                if grow_right:
+                    new_right = min(hi1, right + width)
+                    chunk.extend(range(right + 1, new_right + 1))
+                    right = new_right
+                width = min(2 * width, 1 << 14)
+                T = np.array(sorted(chunk))
+                value, t0 = evaluate(T)
+                for i in np.flatnonzero(value < _INF):
+                    cand = (int(value[i]), int(T[i]), int(t0[i]))
+                    if best is None or cand < best:
+                        best = cand
+            if best is None:
+                return None
+            return best[0], best[2], best[1]
+
+        def point(s, t0, t1):
+            """Weights and quota of the coset point s + t0 e_0 + t1 e_1."""
+            z = list(origin)
+            for p in range(K):
+                m = t0 if p == 0 else (t1 if p == 1 and r == 2 else s[p])
+                if m:
+                    col = columns[p]
+                    for i in range(K):
+                        z[i] += m * col[i]
+            if any(v % d for v in z):
+                raise AssertionError("coset point is not integral")
+            z = [v // d for v in z]
+            return z[:k], z[k]
+
+        push, pop = heapq.heappush, heapq.heappop
+        heap, counter, checks, popped, floor = [], 0, 0, 0, 0
+        stats = self.stats = {}
+
+        def push_plane(cost, s, g):
+            nonlocal counter
+            found = plane_point(s, cost, rest[g])
+            if found is not None and cost + found[0] <= budget:
+                counter += 1
+                push(heap, (cost + found[0], counter, 1, cost, s, g, found[1], found[2]))
+
+        zero = (0,) * K
+        try:
+            if r == K:
+                push_plane(0, zero, 0)
+            elif dist[r][rest[0]] < _INF:
+                heap.append((dist[r][rest[0]], 0, 0, 0, zero, 0, r, True))
+            while heap and heap[0][0] <= budget:
+                floor = heap[0][0]              # no unresolved point is cheaper
+                popped += 1
+                if popped > work:
+                    stats.update(popped=popped, checks=checks, rows=rows["n"], r=r)
+                    return "bound", -(-(self.qnum + heap[0][0]) // d)
+                entry = pop(heap)
+                if entry[2] == 0:               # a multiset of the other generators
+                    _, _, _, cost, s, g, p, own = entry
+                    if own:
+                        push_plane(cost, s, g)
+                    j = order[p]
+                    g1, c1 = step(g, j), cost + costs[j]
+                    v = dist[p][rest[g1]]
+                    if v < _INF and c1 + v <= budget:
+                        counter += 1
+                        push(heap, (c1 + v, counter, 0, c1, s[:p] + (s[p] + 1,) + s[p + 1:], g1, p, True))
+                    if p + 1 < K:
+                        v = dist[p + 1][rest[g]]
+                        if v < _INF and cost + v <= budget:
+                            counter += 1
+                            push(heap, (cost + v, counter, 0, cost, s, g, p + 1, False))
+                    continue
+                key, _, _, cost, s, g, t0, t1 = entry   # a plane and its cheapest point
+                now = plane_point(s, cost, rest[g])
+                if now is None:
+                    continue
+                if (now[1], now[2]) != (t0, t1) or cost + now[0] != key:
+                    if cost + now[0] <= budget:          # rows were added meanwhile: requeue
+                        counter += 1
+                        push(heap, (cost + now[0], counter, 1, cost, s, g, now[1], now[2]))
+                    continue
+                if checks >= limit:
+                    stats.update(popped=popped, checks=checks, rows=rows["n"], r=r)
+                    return "bound", -(-(self.qnum + key) // d)
+                checks += 1
+                weights, q = point(s, t0, t1)
+                win, lose = oracle.extremes(weights, [0] * k)
+                valid = True
+                if win is not None and win[0] < q:          # a winning coalition below q
+                    add_row(list(win[2]) + [-1], 0)
+                    valid = False
+                if lose is not None and lose[0] >= q:       # a losing coalition at q or above
+                    add_row([-x for x in lose[2]] + [1], 1)
+                    valid = False
+                if valid:
+                    stats.update(popped=popped, checks=checks, rows=rows["n"], r=r)
+                    return "found", (q, weights)
+                counter += 1
+                push(heap, (key, counter, 1, cost, s, g, t0, t1))   # the new rows move its point
+        except _Unbounded:
+            stats.update(popped=popped, checks=checks, rows=rows["n"], r=r, unbounded=True)
+            return "bound", -(-(self.qnum + floor) // d)
+        stats.update(popped=popped, checks=checks, rows=rows["n"], r=r)
+        return "optimal", None
 
 
-def _labelled_gap(quota, weights, upper):
-    """Close an integer gap of a game without dummies and with n <= 32."""
+def _integer_gap(sources, lower, upper):
+    """Raise the lower bound and search below ``upper`` at labelled LP optima.
+
+    ``sources`` yields (classes, oracle, solver) with an optimal labelled
+    active set (one weight per player).  Returns (lower, upper, player
+    weights of a cheaper representation or None, stage or None).
+    """
+    weights = stage = None
+    for classes, oracle, solver in sources:
+        group = _Group(solver)
+        if not group.ok:
+            continue
+        bound = group.bound()
+        if bound > upper:
+            raise AssertionError("group bound above a valid representation")
+        if bound > lower:
+            lower, stage = bound, "group relaxation"
+        if lower >= upper:
+            break
+        if not group.searchable:
+            continue
+        solver._flush()
+        status, value = group.search(oracle, classes, upper,
+                                     known=(solver.pool_mat, solver.pool_b))
+        if status == "found":
+            upper, weights = value[0], classes.expand(value[1])
+            lower, stage = upper, "integer gap enumeration"
+        elif status == "optimal":
+            lower, stage = upper, "integer gap enumeration"
+        elif value > lower:
+            lower, stage = value, "integer gap enumeration (limit)"
+        break
+    return lower, upper, weights, stage
+
+
+def _labelled_sources(quota, weights, modes=(False, True)):
+    """Optimal active sets of the labelled game, by default plain pivots first
+    (that path tends to end in a basis with positive multipliers)."""
     classes = _Classes(quota, weights, labelled=True)
     order = [m[0] for m in classes.players]
     diagram = weighted_diagram(quota, weights, order)
     oracle = _Oracle(classes, diagram)
     clipped = [min(quota, v) for v in classes.values]
     common = reduce(gcd, clipped, 0)
-    rows = None
-    for guided in (False, True):     # the plain pivot path tends to end in a positive basis
-        start = [v // common for v in clipped]
-        solver = _ActiveSet(classes, oracle, start, _ceil(Fraction(quota, common)))
-        if not solver.run(guided=guided):
-            return None
-        lam = solver.adj[solver.K - 1, :]
-        rows = [(key[1], key[0] == "W") for j, key in enumerate(solver.rows)
-                if key[0] in ("W", "L") and int(lam[j]) > 0]
-        if len(rows) == classes.k + 1:
-            break                # a basis with strictly positive multipliers
-    if len(rows) != classes.k + 1:
-        return None
-    solver._flush()
-    try:
-        found = _positive_basis_enumeration(oracle, rows, upper,
-                                            known=(solver.pool_mat, solver.pool_b))
-    except (ValueError, ArithmeticError):
-        return None
-    if found is None:
-        return None
-    q, level_weights = found
-    return q, classes.expand(level_weights)
+    for guided in modes:
+        solver = _ActiveSet(classes, oracle, [v // common for v in clipped],
+                            _ceil(Fraction(quota, common)))
+        if solver.run(guided=guided):
+            yield classes, oracle, solver
+
+
+#: Representations with a quota from this size on are first scaled down.
+RESCALE_FROM = 1 << 20
+
+
+def _rescale(oracle, start, quota):
+    """A smaller representation of the same game, as a start for the search.
+
+    The problem depends only on the game, so any representation is as good
+    a start as the given one, and small numbers keep the dynamic programs
+    in machine integers.  ``start`` is divided by 2, 4, 8, ... and rounded
+    as long as one exact pass confirms that the heaviest losing coalition
+    stays below the lightest winning one; its quota is then the heaviest
+    losing weight plus one.  Returns (class weights, quota).
+    """
+    best, s = (list(start), quota), 2
+    while s <= quota:
+        weights = [(2 * v + s) // (2 * s) for v in start]
+        losing, winning = oracle.integer_extrema(weights)
+        if not losing < winning:
+            break
+        best, s = (weights, losing + 1), 2 * s
+    weights, q = best
+    g = reduce(gcd, weights, 0)
+    if g > 1:                                       # all coalition weights are multiples of g
+        weights, q = [v // g for v in weights], _ceil(Fraction(q, g))
+    return weights, q
 
 
 # ---------------------------------------------------------------------------
@@ -1131,7 +1827,32 @@ def minimum_quota(quota: int, weights: Sequence[int], *, max_pivots: int = 200_0
     if quota < 1 or quota > sum(weights):
         raise ValueError("the minimum quota needs a game with winning and losing coalitions")
     order = sorted(range(len(weights)), key=lambda p: (-weights[p], p))
-    diagram = weighted_diagram(quota, weights, order)
+    diagram = None
+    wide = len(weights) * quota >= SUBSET_START_WORK
+    if wide:
+        # a narrow diagram is built and used (see SUBSET_PROBE_WIDTH); the
+        # probe gives up as soon as a level gets wider
+        narrow = len({w for w in weights if w > 0}) * quota // (4 * len(weights))
+        if (len(weights) + 1) // 2 < narrow.bit_length():
+            wide = False                       # at most 2^ceil(n/2) nodes per level
+        else:
+            diagram = _meet_in_the_middle(quota, [weights[p] for p in order], order,
+                                          limit=min(narrow, SUBSET_PROBE_WIDTH))
+            wide = diagram is None
+    if wide:
+        # given weights that are already minimal are proven so by subset sums,
+        # before a wide diagram is built
+        classes = _Classes(quota, weights)
+        clipped = [min(quota, v) for v in classes.values]
+        common = reduce(gcd, clipped, 0)
+        start, upper = [v // common for v in clipped], _ceil(Fraction(quota, common))
+        if upper > 1:
+            qstar = _certify_start(classes, start, upper)
+            if qstar is not None:
+                return MinimumQuotaResult(upper, tuple(classes.expand(start)), upper, upper,
+                                          qstar, "certificate at the given weights")
+    if diagram is None:
+        diagram = weighted_diagram(quota, weights, order)
     essential = sorted(order[i] for i in range(diagram.n)
                        if np.any(diagram.else_children[i] != diagram.then_children[i]))
     if len(essential) < len(weights):
@@ -1148,7 +1869,9 @@ def minimum_quota(quota: int, weights: Sequence[int], *, max_pivots: int = 200_0
     clipped = [min(quota, v) for v in classes.values]
     common = reduce(gcd, clipped, 0)
     incumbent = [v // common for v in clipped]
-    upper = _ceil(Fraction(quota, common))
+    upper = given = _ceil(Fraction(quota, common))
+    if upper >= RESCALE_FROM:
+        incumbent, upper = _rescale(oracle, incumbent, upper)
     lower, lp_bound, stage = 1, None, "trivial"
     if lower < upper:
         solver = _ActiveSet(classes, oracle, incumbent, upper)
@@ -1165,14 +1888,25 @@ def minimum_quota(quota: int, weights: Sequence[int], *, max_pivots: int = 200_0
                 best = _round_candidates(classes, oracle, solver.X, solver.delta, qstar)
                 if best is not None and best[0] < upper:
                     upper, incumbent = best[0], best[1]
-        stage = "certificate at the given weights" if optimal and not solver.moved else "active set"
+        at_start = optimal and not solver.moved and upper == given
+        stage = "certificate at the given weights" if at_start else "active set"
         if lower > upper:
             raise AssertionError("active-set proof contradicts an integer representation")
     final_weights = classes.expand(incumbent)
-    if lower < upper and len(weights) <= gap_players and all(w > 0 for w in weights):
-        gap = _labelled_gap(quota, weights, upper)
-        if gap is not None:
-            upper, final_weights = gap
-            lower, stage = upper, "integer gap enumeration"
+    labelled = lp_bound is not None and all(m == 1 for m in classes.multiplicities)
+    small = len(weights) <= gap_players and all(w > 0 for w in weights)
+    if lower < upper and (labelled or small):
+        # one weight per player: the class LP optimum is already labelled
+        def sources():
+            if labelled:
+                yield classes, oracle, solver
+            if small:
+                # from the smallest representation known so far: same game, smaller numbers
+                yield from _labelled_sources(upper, final_weights, (False,) if labelled else (False, True))
+        lower, upper, found, gap_stage = _integer_gap(sources(), lower, upper)
+        if found is not None:
+            final_weights = found
+        if gap_stage is not None:
+            stage = gap_stage
     return MinimumQuotaResult(upper if lower == upper else None, tuple(final_weights),
                               lower, upper, lp_bound, stage)

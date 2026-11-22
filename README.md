@@ -258,13 +258,22 @@ floating-point inverse, accepted only after an exact check) or, if its
 determinant is large, by pivots that do not move the point. This skips the
 long runs of degenerate pivots and proves at the start that already
 minimal weights are minimal
-(`result.stage == "certificate at the given weights"`). When the LP bound
-and the best integer representation still differ (an *integer gap*, e.g.
-the IMF game of 2002), all cheaper integer slack combinations of a positive
-basis are enumerated (games with at most 32 players). Floating point only
-proposes candidates; every bound is checked with exact integers. Each of
-the 29 benchmark games of the paper, among them the IDB and IMF games,
-takes less than 0.6 s including the construction of the diagram.
+(`result.stage == "certificate at the given weights"`). When the diagram
+would be wide, that proof is first tried without it: at the given weights
+a coalition is tight exactly when it weighs the quota or one less, so
+subset sums over the weight classes suffice.
+
+When the LP bound and the best integer representation still differ (an
+*integer gap*, e.g. the IMF game of 2002), Gomory's group relaxation at the
+optimal basis raises the lower bound, and the integer points near the LP
+optimum are searched by cost: in the plane of the one or two cheapest basis
+directions, the known coalitions cut out a polygon whose cheapest lattice
+point is found exactly, and every point that fails adds the violated
+coalition as a cutting plane (games with at most 32 players, or with
+pairwise different weights). Floating point only proposes candidates; every
+bound is checked with exact integers. Each of the 29 benchmark games of the
+paper, among them the IDB and IMF games, takes at most 0.5 s including the
+construction of the diagram.
 
 ## Version 2
 
